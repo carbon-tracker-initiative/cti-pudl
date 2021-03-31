@@ -1,0 +1,21 @@
+name: pudl-ct
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - pip~=21.0
+  - python>=3.8,<3.10
+  - python-snappy~=0.6.0 # Ensures snappy-dev library gets installed
+
+  # So we can run a notebook server
+  - jupyterlab~=3.0
+  - jupyter-resource-usage~=0.5.0
+  - nbgitpuller~=0.9
+
+  - pip:
+    # PUDL development branch
+    - git+https://github.com/catalyst-cooperative/pudl.git@dev
+    # For Running Jupyter Notebook Server w/o complaints about build:
+    - jupyter-offlinenotebook~=0.2
+    # Install the local package such that we can do development work:
+    - --editable ./
