@@ -2,6 +2,9 @@
 # Standard libraries
 import logging
 import pathlib
+import re
+from collections import Counter, defaultdict
+import itertools
 
 from copy import deepcopy
 import dask.dataframe as dd
@@ -24,6 +27,12 @@ idx_plant_fuel = ['report_date', 'plant_id_pudl', 'fuel_type_code_pudl']
 IDX_PLANT_FUEL = ['report_date', 'plant_id_pudl', 'fuel_type_code_pudl']
 IDX_PLANT_PUDL = ['report_date', 'plant_id_pudl', ]
 IDX_BOILER = ['plant_id_eia', 'report_date', 'boiler_id']
+# IDX_STEAM = ['utility_id_ferc1', 'plant_name_ferc1', 'report_year']
+IDX_STEAM = ['utility_id_ferc1', 'plant_id_ferc1', 'report_year']
+
+
+COLS_CAPEX = ['capex_total_shifted', 'capex_annual_addt',
+              'capex_annual_addt_rolling']
 
 COLS_SUM_CEMS = [
     'so2_mass_lbs',
@@ -37,6 +46,11 @@ WA_COL_DICT_STEAM = {
     'opex_nonfuel_per_mwh': 'net_generation_mwh',
     'opex_fuel_per_mwh': 'net_generation_mwh',
     'capex_per_mw': 'capacity_mw',
+    'capex_annual_per_mwh': 'net_generation_mwh',
+    'capex_annual_per_mw': 'capacity_mw',
+    'capex_annual_per_kw': 'capacity_mw',
+    'capex_annual_per_mwh_rolling': 'net_generation_mwh',
+    'capex_annual_per_mw_rolling': 'capacity_mw',
 }
 
 
@@ -45,9 +59,15 @@ file_path_pudl_rmi_main = pathlib.Path().cwd().parent.parent / \
 file_path_ferc1_to_eia = file_path_pudl_rmi_main / \
     'outputs' / 'ferc1_to_eia_full.pkl.gz'
 
-path_inputs = pathlib.Path().cwd().parent / 'inputs'
-path_nems = path_inputs / 'pltf860.csv'
-path_nems_infl = path_inputs / 'NEMS_GDP_infl.xlsx'
+PATH_INPUTS = pathlib.Path().cwd().parent / 'inputs'
+path_nems = PATH_INPUTS / 'pltf860.csv'
+path_nems_infl = PATH_INPUTS / 'NEMS_GDP_infl.xlsx'
+
+NEMS_FILE_NAMES = {
+    2017: 'pltf860.v1.201.txt',
+    2018: 'pltf860.v1.206.txt',
+    2019: 'pltf860.v1.210.txt',
+}
 
 
 ################################
@@ -109,9 +129,32 @@ def prep_gens_eia(pudl_out):
             .dropna(),
             how='left'
         )
+        .pipe(remove_gen_id_leading_zeros)
+        .drop_duplicates(subset=IDX_GEN)
 
     )
     return gen
+
+
+def remove_gen_id_leading_zeros(gen_df):
+    """
+    Remove leading zeros from a table with generator ids.
+
+    Args:
+        gen_df (pandas.DataFrame): table with `generator_id` column.
+    """
+    # Remove ONLY leading zeroes followed exclusively by digits in the
+    # generator_id
+    gen_df["fixed_id"] = gen_df.generator_id.apply(
+        lambda x: re.sub(r'^0+(\d+$)', r'\1', x))
+    logger.info(
+        "Fixed leading-zero generator_id in "
+        f"{len(gen_df.loc[gen_df.generator_id != gen_df.fixed_id])} records.")
+    gen_df = (
+        gen_df.assign(generator_id=lambda x: x.fixed_id)
+        .drop(columns=['fixed_id'])
+    )
+    return gen_df
 
 
 def _prep_gen_agg_dict():
@@ -214,6 +257,77 @@ def prep_plants_ferc(pudl_out):
     return steam_df
 
 
+def calc_annual_capital_addts_ferc1(steam_df, window=3):
+    """
+    Calculate annual capital additions for FERC1 steam records.
+
+    Convert the capex_total column into annual capital additons the
+    `capex_total` column is the cumulative capital poured into the plant over
+    time. This function takes the annual difference should generate the annual
+    capial additions. It also want generates a rolling average, to smooth out
+    the big annual fluxuations.
+
+    Args:
+        steam_df (pandas.DataFrame): result of `prep_plants_ferc()`
+
+    Returns:
+        pandas.DataFrame: augemented version of steam_df with two additional
+        columns: `capex_annual_addt` and `capex_annual_addt_rolling`.
+    """
+    # we need to sort the df so it lines up w/ the groupby
+    steam_df = steam_df.sort_values(IDX_STEAM)
+    # we group on everything but the year so the groups are multi-year unique
+    # plants the shift happens within these multi-year plant groups
+    steam_df['capex_total_shifted'] = steam_df.groupby(
+        [x for x in IDX_STEAM if x != 'report_year'])[['capex_total']].shift()
+    steam_df = steam_df.assign(
+        capex_annual_addt=lambda x: x.capex_total - x.capex_total_shifted
+    )
+
+    addts = pudl.helpers.generate_rolling_avg(
+        steam_df,
+        group_cols=[x for x in IDX_STEAM if x != 'report_year'],
+        data_col='capex_annual_addt',
+        window=3
+    )
+
+    steam_df_w_addts = (
+        pd.merge(
+            steam_df,
+            addts[IDX_STEAM + ['capex_total', 'capex_annual_addt_rolling']],
+            on=IDX_STEAM + ['capex_total'],
+            how='left',
+        )
+        .assign(
+            capex_annual_per_mwh=lambda x:
+                x.capex_annual_addt / x.net_generation_mwh,
+            capex_annual_per_mw=lambda x:
+                x.capex_annual_addt / x.capacity_mw,
+            capex_annual_per_kw=lambda x:
+                x.capex_annual_addt / x.capacity_mw / 1000,
+            capex_annual_per_mwh_rolling=lambda x:
+                x.capex_annual_addt_rolling / x.net_generation_mwh,
+            capex_annual_per_mw_rolling=lambda x:
+                x.capex_annual_addt_rolling / x.capacity_mw,
+        )
+    )
+    # bb tests for volumne of negative annual capex
+    neg_cap_addts = len(
+        steam_df_w_addts[steam_df_w_addts.capex_annual_addt_rolling < 0]) \
+        / len(steam_df_w_addts)
+    neg_cap_addts_mw = (
+        steam_df_w_addts[
+            steam_df_w_addts.capex_annual_addt_rolling < 0]
+        .net_generation_mwh.sum()
+        / steam_df_w_addts.net_generation_mwh.sum())
+    message = f'{neg_cap_addts:.02%} records have negative capitial additions: {neg_cap_addts_mw:.02%}'
+    if neg_cap_addts > .1:
+        warnings.warn(message)
+    else:
+        logger.info(message)
+    return steam_df_w_addts
+
+
 def agg_plants_ferc_by_plant_fuel(steam_df):
     """Aggregate FERC steam plants by plant fuel."""
     steam_by_fuel = (
@@ -225,7 +339,8 @@ def agg_plants_ferc_by_plant_fuel(steam_df):
             ),
             (
                 steam_df.groupby(idx_plant_fuel, as_index=False)
-                [['opex_nonfuel', 'net_generation_mwh', 'capex_total']]
+                [['opex_nonfuel', 'net_generation_mwh', 'capex_total']
+                 + COLS_CAPEX]
                 .sum(min_count=1)
             ),
             on=idx_plant_fuel,
@@ -233,7 +348,7 @@ def agg_plants_ferc_by_plant_fuel(steam_df):
             validate='1:1'
         )
 
-        .merge(
+        .merge(  # Is this doing nothing??? can I remove it??
             steam_df.groupby(IDX_PLANT_PUDL, as_index=False)
             [[]].sum(min_count=1),
             on=IDX_PLANT_PUDL,
@@ -313,11 +428,11 @@ def grab_ferc1_to_eia_connection():
     return ferc1_to_eia
 
 
-def prep_ferc1_to_eia(ferc1_to_eia, pudl_out):
+def prep_ferc1_to_eia(ferc1_to_eia, steam_df):
     """Prepate the."""
     steam = (
         pd.merge(
-            pudl_out.plants_steam_ferc1().rename(
+            steam_df.rename(  # pudl_out.plants_steam_ferc1()
                 columns={'record_id': 'record_id_ferc1'}),
             ferc1_to_eia,
             on=['record_id_ferc1'],
@@ -327,7 +442,7 @@ def prep_ferc1_to_eia(ferc1_to_eia, pudl_out):
         )
         .assign(
             plant_part_eia='plant_unit',
-            report_date=lambda x: pd.to_datetime(x.report_year, format='%Y')
+            # report_date=lambda x: pd.to_datetime(x.report_year, format='%Y')
         )
         .rename(columns={'plant_part': 'plant_part_ferc1'})
     )
@@ -429,18 +544,22 @@ def agg_one_id_steam(steam_w_count):
         "of steam records match with one unit"
     )
 
-    cols_ferc1 = ['opex_nonfuel_per_mwh', 'capex_per_mw']
+    cols_ferc1 = (
+        list(WA_COL_DICT_STEAM.keys())
+        + ['opex_nonfuel', 'net_generation_mwh', 'capex_total']
+        + COLS_CAPEX)
+    # ['opex_nonfuel_per_mwh', 'capex_per_mw']
     steam_1_1_agg = steam_1_1[IDX_UNIT +
                               cols_ferc1].assign(steam_agg_type="1:1")
     steam_1_m_agg = (
         weighted_average(
-            steam_1_m, {'opex_nonfuel_per_mwh': 'net_generation_mwh',
-                        'capex_per_mw': 'capacity_mw'},
+            # {'opex_nonfuel_per_mwh': 'net_generation_mwh','capex_per_mw': 'capacity_mw'},
+            steam_1_m,  WA_COL_DICT_STEAM,
             idx_cols=IDX_UNIT)
         .merge(
             steam_1_m.groupby(IDX_UNIT, as_index=False)
             [['opex_nonfuel', 'net_generation_mwh',
-                'capex_total']].sum(min_count=1),
+                'capex_total'] + COLS_CAPEX].sum(min_count=1),
             on=IDX_UNIT,
             how='outer'
         )
@@ -451,10 +570,10 @@ def agg_one_id_steam(steam_w_count):
     return steam_agg
 
 
-def merge_eia_ferc_unit(gen, pudl_out):
+def merge_eia_ferc_unit(gen, steam_df):
     """M."""
     ferc1_to_eia = grab_ferc1_to_eia_connection()
-    steam = prep_ferc1_to_eia(ferc1_to_eia, pudl_out)
+    steam = prep_ferc1_to_eia(ferc1_to_eia, steam_df)
     eia_ferc_unit = (
         count_unique_ids_per_plant_part(steam, gen, id_col='unit_id_pudl')
         .pipe(count_unique_steam_records_per_id)
@@ -473,10 +592,10 @@ def merge_eia_ferc_unit(gen, pudl_out):
 ################################
 
 
-def merge_eia_ferc(gen, unit, steam_df, steam_by_fuel, pudl_out):
-    """Merge EIA and FERC on ."""
+def merge_eia_ferc(gen, unit, steam_df, steam_by_fuel):
+    """Merge EIA and FERC on unit id or by plant-fuel."""
     eia_ferc_fuel = merge_eia_ferc_simple(unit, steam_df, steam_by_fuel)
-    eia_ferc_unit = merge_eia_ferc_unit(gen, pudl_out)
+    eia_ferc_unit = merge_eia_ferc_unit(gen, steam_df)
 
     ferc_merge = (
         pd.merge(
@@ -487,23 +606,37 @@ def merge_eia_ferc(gen, unit, steam_df, steam_by_fuel, pudl_out):
             how='outer',
             suffixes=('_plant_fuel', '_unit')
         )
-        .assign(
-            opex_nonfuel_per_mwh=lambda x:
-                x.opex_nonfuel_per_mwh_unit.fillna(
-                    x.opex_nonfuel_per_mwh_plant_fuel),
-            opex_nonfuel_per_mwh_source=lambda x: np.where(
+    )
+    assign_cols = [
+        'opex_nonfuel_per_mwh',
+        'capex_annual_per_mwh',
+        'capex_annual_per_mw',
+        'capex_annual_per_kw',
+        'capex_annual_addt',
+        'capex_annual_addt_rolling',
+    ]
+    for col in assign_cols:
+        ferc_merge[col] = ferc_merge[f'{col}_unit'].fillna(
+            ferc_merge[f'{col}_plant_fuel'])
+
+    ferc_merge = (
+        ferc_merge.assign(
+            ferc1_source_level=lambda x: np.where(
                 x.opex_nonfuel_per_mwh_unit.notnull(), 'unit',
                 np.where(
                     x.opex_nonfuel_per_mwh_plant_fuel.notnull(),
-                    'plant_fuel', pd.NA))
+                    'plant_fuel', pd.NA)),
         )
         .pipe(label_multi_method_assoc)
     )
     _ = _check_merge_eia_ferc(ferc_merge)
     # once we've run the checks, we can drop these fuel/unit columns
     ferc_merge = (
-        ferc_merge.drop(['opex_nonfuel_per_mwh_plant_fuel',
-                         'opex_nonfuel_per_mwh_unit']))
+        ferc_merge.drop(columns=(
+            ferc_merge.filter(like='_unit')
+            + ferc_merge.filter(like='_plant_fuel')).columns
+        )
+    )
     unit_w_ferc = (
         pd.merge(
             unit,
@@ -525,15 +658,15 @@ def label_multi_method_assoc(unit_w_ferc):
     assoc_types = (
         unit_w_ferc
         .groupby(IDX_PLANT_PUDL, dropna=False)
-        [['opex_nonfuel_per_mwh_source']]
+        [['ferc1_source_level']]
         .nunique()
         .reset_index()
         .assign(
             eia_ferc_merge_multi_method_plant=lambda x: np.where(
-                x.opex_nonfuel_per_mwh_source > 1,
+                x.ferc1_source_level > 1,
                 True, False)
         )
-        .drop(columns=['opex_nonfuel_per_mwh_source'])
+        .drop(columns=['ferc1_source_level'])
     )
 
     gens_w_ferc1_w_label = (
@@ -572,83 +705,163 @@ def _check_merge_eia_ferc(gens_w_ferc1):
 ################################
 
 
-def get_nems(nems_path):
-    """Grab NEMS and perform basic column cleaning."""
+def get_nems_headers():
+    """
+    Get non-duplicate headers for NEMS.
+
+    Returns:
+        iterable
+    """
+    headers = list(pd.read_excel(pathlib.Path.cwd().parent /
+                   'inputs' / 'pltf860defs_aeo2018.xlsx').T.loc['Definition'])
+    counts = Counter(headers)
+    suffix_counter = defaultdict(lambda: itertools.count(1))
+    headers_non_dupes = [
+        elem if counts[elem] == 1
+        else elem + f'_{next(suffix_counter[elem])}'
+        for elem in headers
+    ]
+    return headers_non_dupes
+
+
+def get_nems_year(year):
+    """
+    Get NEMS data for a single year.
+
+    Args:
+        year (integer): four-digit year. Must be a key in NEMS_FILE_NAMES.
+
+    Returns:
+        pandas.DataFrame:
+    """
+    if year not in NEMS_FILE_NAMES:
+        raise AssertionError(
+            f"{year} not in NEMS_FILE_NAMES map. Add new year and file to "
+            "NEMS_FILE_NAMES or try different year. Current years are: "
+            f"{NEMS_FILE_NAMES.keys}"
+        )
     nems_df = (
         pd.read_csv(
-            nems_path,
-            dtype={'plant_id': pd.Int64Dtype(),
-                   'fixed_om_kw_87': 'float32',
-                   'variable_om_mwh_87': 'float32',
+            PATH_INPUTS / NEMS_FILE_NAMES[year],
+            delimiter=":",
+            names=get_nems_headers(),
+            dtype={'Plant ID': pd.Int64Dtype(),
                    'EFD Fuel Codes.1': 'string',  # this is for memory
                    'EFD Fuel Codes.2': 'string',  # mixed string/int cols
                    })
+        .assign(report_year=year, report_date=f'{year}-01-01')
+    )
+
+    return nems_df
+
+
+def get_nems():
+    """Grab NEMS and perform basic column cleaning."""
+    # first grab each year of NEMS data
+    nems_dfs = []
+    for year in NEMS_FILE_NAMES.keys():
+        nems_dfs.append(get_nems_year(year))
+    # then squish them together and apply common cleaning
+    nems_df = (
+        pd.concat(nems_dfs)
         .rename(columns={
-            'plant_id': 'plant_id_eia',
+            'Plant ID': 'plant_id_eia',
             'Unit ID': 'generator_id',
             'Name Plate Capacity (shared if multiple owners) (MW)':
                 'capacity_mw',
             'Average Capacity Factor': 'capacity_factor',
+            'Annual Investment in Capital Additions (87$/kW)':
+                'capex_annual_per_kw_87',
+            'Variable O&M Cost (87$/MWH)': 'variable_om_mwh_87',
+            'Fixed O&M Cost (87$/kW)': 'fixed_om_kw_87',
         })
-        .assign(report_year=2019, report_date='2019-01-01')
-        .astype({'report_date': 'datetime64[ns]',
-                 'report_year': pd.Int64Dtype()})
+        .astype({
+            'report_date': 'datetime64[ns]',
+            'report_year': pd.Int64Dtype(),
+            'fixed_om_kw_87': 'float32',
+            'variable_om_mwh_87': 'float32',
+        })
+    )
+    # theres a ton of trailing zeros on the generator_id column which gotta go
+    # this is the only string column we need rn, but beware if others are used
+    nems_df.loc[nems_df['generator_id'].notnull(), 'generator_id'] = (
+        nems_df.loc[nems_df['generator_id'].notnull(), 'generator_id']
+        .astype(str).str.strip()
     )
     return nems_df
 
 
-def prep_nems(pudl_out, nems_path):
+def prep_nems():
     """Grab NEMS and groupby plant-fuel.
 
     Note: There are ~1500 records which have a 0% capacity factor, thus 0 net
     generation, and thus have a calculated fixed cost per MWh of inf.
     """
-    nems_df = pd.merge(
-        get_nems(nems_path)
-        .groupby(by=['plant_id_eia', 'generator_id',
-                     'report_date', 'report_year'])
-        [['capacity_factor', 'capacity_mw',
-          'fixed_om_kw_87', 'variable_om_mwh_87']]
-        .mean().reset_index(),
-        pudl_out.gens_eia860().drop(columns=['capacity_mw']),
-        on=['plant_id_eia', 'generator_id', 'report_date'],
-        how='left',
-        validate='1:1'
+    # get nems and grouby the gen ids, so we can merge w/ EIA gens
+    nems_df = (
+        get_nems().groupby(by=IDX_GEN + ['report_year'], as_index=False)
+        [['capacity_factor', 'capacity_mw', 'fixed_om_kw_87',
+          'variable_om_mwh_87', 'capex_annual_per_kw_87']]
+        .mean()
+    )
+    # merge with the gens, but remove the capacity column bc NEMS also has it
+    # nems_df = pd.merge(
+    #    nems_prep,
+    #    pudl_out.gens_eia860().drop(columns=['capacity_mw']),
+    #    on=['plant_id_eia', 'generator_id', 'report_date'],
+    #    how='left',
+    #    validate='1:1'
+    # )
+    # Calculate required fields and adjust cost for inflation.
+    nems_df = calc_inflation_nems(
+        nems_df,
+        cols_to_convert=['variable_om_mwh_87',
+                         'fixed_om_kw_87', 'capex_annual_per_kw_87'],
+        drop=False
     )
 
-    # Calculate required fields and adjust cost for inflation.
-    nems_df = calc_inflation(path_nems_infl, 1987, nems_df, 'fixed_om_kw_87')
-    nems_df = calc_inflation(path_nems_infl, 1987,
-                             nems_df, 'variable_om_mwh_87')
     nems_df = (
-        nems_df[nems_df.plant_id_pudl.notnull()]
-        .assign(
+        nems_df.assign(
             net_generation_mwh_nems=lambda x:
                 x.capacity_factor * 8760 * x.capacity_mw,
-            fixed_om_19_nems=lambda x:
-                x.fixed_om_kw_19_nems * 1000 * x.capacity_mw,
-            fixed_om_mwh_19_nems=lambda x:
-                x.fixed_om_19_nems / x.net_generation_mwh_nems,
-            variable_om_19_nems=lambda x:
-                x.variable_om_mwh_19_nems * x.net_generation_mwh_nems,
-            # variable_om_mwh_19_nems=lambda x: (x.variable_om_mwh_19_nems),
-            fix_var_om_mwh_19_nems=lambda x:
-                x.variable_om_mwh_19_nems + x.fixed_om_kw_19_nems,
+            fixed_om=lambda x:
+                x.fixed_om_kw * 1000 * x.capacity_mw,
+            fixed_om_mwh=lambda x: x.fixed_om / x.net_generation_mwh_nems,
+            variable_om=lambda x:
+                x.variable_om_mwh * x.net_generation_mwh_nems,
+            # variable_om_mwh=lambda x: (x.variable_om_mwh),
+            fix_var_om_mwh=lambda x: x.variable_om_mwh + x.fixed_om_kw,
+            fixed_v_total_ratio=lambda x:
+                x.fixed_om / (x.fixed_om + x.variable_om),
+            var_v_total_ratio=lambda x:
+                x.variable_om / (x.fixed_om + x.variable_om),
+            fix_var_om=lambda x: x.fixed_om + x.variable_om
         )
     )
 
-    nems_agg = (nems_df
-                .groupby(by=IDX_PLANT_FUEL)
-                .agg({'variable_om_19_nems': 'sum',
-                      'fixed_om_19_nems': 'sum',
-                      'capacity_mw': 'sum',
-                      'net_generation_mwh_nems': 'sum',
-                      }))
+    return nems_df
+
+
+def _agg_nems_to_plant_fuel(nems_df):
+    """
+    Aggregate NEMS to `IDX_PLANT_FUEL`.
+
+    This is from EI work- not sure if we need it in this case.
+    """
+    # aggregate to plant-fuel
+    nems_agg = (
+        nems_df.groupby(by=IDX_PLANT_FUEL)
+        .agg({'variable_om': 'sum',
+              'fixed_om': 'sum',
+              'capacity_mw': 'sum',
+              'net_generation_mwh_nems': 'sum',
+              }))
     nems_wtav = weighted_average(
         nems_df,
-        {'fixed_om_mwh_19_nems': 'net_generation_mwh_nems',
-         'variable_om_mwh_19_nems': 'net_generation_mwh_nems',
-         'fix_var_om_mwh_19_nems': 'net_generation_mwh_nems',
+        {'fixed_om_mwh': 'net_generation_mwh_nems',
+         'variable_om_mwh': 'net_generation_mwh_nems',
+         'fix_var_om_mwh': 'net_generation_mwh_nems',
+         'capex_annual_per_kw': 'capacity_mw',
          # 'fixed_v_total_ratio': 'capacity_mw'
          },
         IDX_PLANT_FUEL)
@@ -657,49 +870,63 @@ def prep_nems(pudl_out, nems_path):
         pd.merge(nems_agg, nems_wtav,
                  on=IDX_PLANT_FUEL,
                  how='outer')
-        .assign(fixed_v_total_ratio=lambda x: x.fixed_om_19_nems /
-                (x.fixed_om_19_nems + x.variable_om_19_nems),
-                var_v_total_ratio=lambda x: x.variable_om_19_nems /
-                (x.fixed_om_19_nems + x.variable_om_19_nems),
-                fix_var_om_19_nems=lambda x:
-                    x.fixed_om_19_nems + x.variable_om_19_nems
-                )
+        .assign(
+            fixed_v_total_ratio=lambda x:
+            x.fixed_om / (x.fixed_om + x.variable_om),
+            var_v_total_ratio=lambda x:
+            x.variable_om / (x.fixed_om + x.variable_om),
+            fix_var_om=lambda x: x.fixed_om + x.variable_om
+        )
     )
-
     return nems_cost_df
 
 
-def calc_inflation(path_nems_inflation, base_year, df, cost_col_name):
-    """Calculate new cost with inflation depending on index specified.
+def calc_inflation_nems(nems_df_raw, cols_to_convert, drop=True):
+    """
+    Convert NEMS 1987$ into nominal $s.
 
     This function calculates inflation using NEMS model to calculate
     nominal fixed and variable costs of NEMS data (reported in 87$ -
     equivalent to 1).
 
     Args:
-        base_year (int): The $year the cost values are reported in. Important
-            for 'fred' calculations.
         df (pandas.DataFrame): The DataFrame containing the column on which
             you'd like to run an inflation calculation.
-        cost_col_names (list): The names of the column of values you'd like to
+        cols_to_convert (list): The names of the column of values you'd like to
             calculate inflation for.
+        drop (boolean): default True. If True, drop cols_to_convert before
+            returning.
     Returns:
         pd.DataFrame: The new, inflation adjusted values for a given year under
             the same name as the original column.
     """
     # For use with NEMS fixed and variable cost data. Reported in '87' dollars
-    # which are equal to 1 and only used for 2018 data. (Technically 2019, but
-    # will report as 2018)
+    # go get the NEMS inflation rates
     nems_idx = pd.read_excel(
-        path_nems_inflation, header=3, names=['Year', 'Rate'])
-    nems_2019 = float(nems_idx.loc[nems_idx['Year'] == 2019].Rate)
-    df[cost_col_name] = df[cost_col_name] * nems_2019
-    infl_df = df.rename(
-        columns={cost_col_name: cost_col_name[:-2] + '19_nems'})
-    return infl_df
+        path_nems_infl, header=3, names=['report_year', 'inflation_rate_v_87'])
+
+    # squish them onto raw NEMS df
+    nems_df_raw = pd.merge(
+        nems_df_raw,
+        nems_idx,
+        on=['report_year'],
+        how='left',
+        validate='m:1'
+    )
+
+    # create new columns with nominal $s without the _87
+    nems_df_raw.loc[:, [c.replace('_87', '') for c in cols_to_convert]] = (
+        nems_df_raw.loc[:, cols_to_convert]
+        .multiply(nems_df_raw.loc[:, 'inflation_rate_v_87'], axis="index")
+        .to_numpy()  # convert to arrary so loc can handle multiple columns
+    )
+    if drop:
+        nems_df_raw = nems_df_raw.drop(
+            columns=cols_to_convert + ['inflation_rate_v_87'])
+    return nems_df_raw
 
 
-def add_nems(gens_w_ferc1, pudl_out, path_nems):
+def add_nems(gens_w_ferc1, pudl_out):
     """Incorporate NEMS aeo2020 data to account for missing FERC O&M costs.
 
     Args:
@@ -712,14 +939,20 @@ def add_nems(gens_w_ferc1, pudl_out, path_nems):
     nems_merge_df = (
         pd.merge(
             gens_w_ferc1,
-            prep_nems(pudl_out, path_nems).pipe(
-                pudl.helpers.convert_cols_dtypes, 'ferc1'),
+            prep_nems().pipe(pudl.helpers.convert_cols_dtypes, 'ferc1'),
             how='left',
-            on=IDX_PLANT_FUEL,
+            on=IDX_GEN,
             suffixes=("", "_nems"),
             validate='m:1'
         )
     )
+    missing = len(
+        nems_merge_df[nems_merge_df.plant_id_pudl.isnull()]) / len(nems_merge_df)
+    logger.info(f"NEMS gens w/o mathcing EIA gens: {missing:.1%}")
+    if missing > .05:
+        raise AssertionError(
+            "Too many NEMS generators that don't match with EIA gens. Check `prep_nems()`"
+        )
     return nems_merge_df
 
 
@@ -772,7 +1005,7 @@ def fill_in_opex_w_nems(gens_w_ferc1_nems):
         .assign(
             opex_nonfuel_per_mwh=lambda x:
                 x.opex_nonfuel_per_mwh.fillna(
-                    x.variable_om_mwh_19_nems + x.fixed_om_mwh_19_nems),
+                    x.variable_om_mwh + x.fixed_om_mwh),
             opex_fixed_per_mwh=lambda x: np.where(
                 x.fixed_v_total_ratio.notnull(),
                 x.opex_nonfuel_per_mwh * x.fixed_v_total_ratio,
@@ -819,33 +1052,41 @@ def get_cems(epacems_path):
     return cems_by_boiler
 
 
-def stuff(cems_byplant, gen, pudl_out):
+def stuff(cems_by_boiler, gen, pudl_out):
     """Do cems stuff."""
     eia_with_boiler_id = (
-        pudl_out.bga()[IDX_BOILER + ['unit_id_eia']].drop_duplicates()
+        pudl_out.bga()[IDX_BOILER + ['unit_id_pudl']].drop_duplicates()
     )
     # Add boiler id to EIA data. Boilder id matches (almost) with CEMS unitid.
     eia_cems_merge = (
         pd.merge(
             eia_with_boiler_id,
-            cems_byplant,
+            cems_by_boiler,
             on=IDX_BOILER,
             how='right',
             validate='m:1'
         )
-        .groupby(idx_unit_eia, dropna=False)[COLS_SUM_CEMS]
+        .groupby(IDX_UNIT, dropna=False)[COLS_SUM_CEMS]
         .sum(min_count=1)
         .reset_index()
         .assign(so2_mass_tons=lambda x: x.so2_mass_lbs / 2000,
                 nox_mass_tons=lambda x: x.nox_mass_lbs / 2000)
         .drop(['so2_mass_lbs', 'nox_mass_lbs'], axis=1)
+        .pipe(pudl.helpers.convert_cols_dtypes, 'eia')
         .merge(
-            gen.drop_duplicates(subset=idx_unit_eia)
-            [idx_unit_eia + ['operational_status',
-                             'sector_name', 'fuel_type_code_pudl']],
-            on=idx_unit_eia,
+            gen.drop_duplicates(subset=IDX_UNIT)
+            [IDX_UNIT + ['operational_status', 'sector_name',
+                         'fuel_type_code_pudl']],
+            on=IDX_UNIT,
             validate='1:1',
             how='left'
+        )
+        .merge(
+            gen.groupby(IDX_UNIT, dropna=False, as_index=False)
+            .agg({'unit_id_eia': str_squish, 'generator_id': str_squish}),
+            on=IDX_UNIT,
+            how='left',
+            validate='1:1'
         )
     )
     return eia_cems_merge
@@ -908,4 +1149,4 @@ composite_id_assign = composite_unit_gen_id = (
 
 def str_squish(x):
     """Squish strings from a groupby into a list."""
-    return '; '.join(list(map(str, list(x.unique()))))
+    return '; '.join(list(map(str, [x for x in x.unique() if x is not pd.NA])))
