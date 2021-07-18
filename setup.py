@@ -18,7 +18,7 @@ setup(
     license="MIT",
     version='0.0.1',
     install_requires=[
-        "catalystcoop.pudl>0.3.2",
+        "pudl_rmi @ git+ssh://git@github.com/catalyst-cooperative/rmi-ferc1-eia",
     ],
     python_requires=">=3.8,<3.10",
     classifiers=[

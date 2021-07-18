@@ -13,8 +13,8 @@ dependencies:
   - nbgitpuller~=0.9
 
   - pip:
-    # PUDL development branch
-    - git+https://github.com/catalyst-cooperative/pudl.git@dev
+    # PUDL development branch (this will be a part of the pudl_rmi)
+    # - git+https://github.com/catalyst-cooperative/pudl.git@dev
     # For Running Jupyter Notebook Server w/o complaints about build:
     - jupyter-offlinenotebook~=0.2
     # Install the local package such that we can do development work:
