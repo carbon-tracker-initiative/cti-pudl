@@ -1268,17 +1268,22 @@ def fill_in_opex_w_nems(gens_w_ferc1_nems):
 ################################
 
 
-def get_cems(epacems_path):
+def get_cems(epacems_path, years=()):
     """Get annual CEMS data."""
     # A list of the columns you'd like to include in your analysis
     idx_cols_cems = [
         'year', 'plant_id_eia', 'unitid'
     ]
+    years_filter = pudl.output.epacems.year_state_filter(years=years)
 
     # Select emissions data are grouped by state, plant_id and unit_id
     # Remember to change the datatype for 'state' from category to string
     my_cems_dd = (
-        dd.read_parquet(epacems_path, columns=idx_cols_cems + COLS_SUM_CEMS)
+        dd.read_parquet(
+            epacems_path,
+            columns=idx_cols_cems + COLS_SUM_CEMS,
+            filters=years_filter,
+        )
         .astype({'year': int})
         .groupby(idx_cols_cems)
         [COLS_SUM_CEMS]
