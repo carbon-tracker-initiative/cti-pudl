@@ -742,7 +742,7 @@ def merge_eia_ferc_unit(gen, steam_df, unit_id_col='unit_id_pudl'):
 ################################
 
 
-def merge_eia_ferc(gen, steam_df, unit_id_col, unit=None):
+def merge_eia_ferc(gen, steam_df, unit_id_col, unit=None, debug=False):
     """Merge EIA and FERC on unit id or by plant-fuel."""
     # create unit records - use these to merge the FERC plant-fuel data onto
     # and
@@ -785,13 +785,14 @@ def merge_eia_ferc(gen, steam_df, unit_id_col, unit=None):
         .pipe(label_multi_method_assoc)
     )
     _ = _check_merge_eia_ferc(ferc_merge)
-    # once we've run the checks, we can drop these fuel/unit columns
-    ferc_merge = (
-        ferc_merge.drop(columns=(
-            ferc_merge.filter(like='_unit')
-            + ferc_merge.filter(like='_plant_fuel')).columns
+    if not debug:
+        # once we've run the checks, we can drop these fuel/unit columns
+        ferc_merge = (
+            ferc_merge.drop(columns=(
+                ferc_merge.filter(like='_unit')
+                + ferc_merge.filter(like='_plant_fuel')).columns
+            )
         )
-    )
     unit_w_ferc = (
         pd.merge(
             unit,
