@@ -905,7 +905,7 @@ def get_gem():
     return gem
 
 
-def convert_nem_cols_to_gen_ids(gem):
+def convert_gem_cols_to_gen_ids(gem):
     """Convert the list of generators in a string in a column to a column."""
     split_ids = gem.generator_ids_eia.str.split(
         pat=', ', expand=True).add_prefix('id_')
@@ -926,7 +926,7 @@ def convert_nem_cols_to_gen_ids(gem):
 def merge_gem_w_df(df, df_source='eia'):
     """Merge GEM unit IDs onto a df w/ plant_id_eia & generator_id cols."""
     gem = get_gem()
-    units_gem = convert_nem_cols_to_gen_ids(gem)
+    units_gem = convert_gem_cols_to_gen_ids(gem)
     # merge in the GEM IDs into the generator table
     gen_w_gem = (
         pd.merge(
@@ -1303,11 +1303,17 @@ def get_cems(epacems_path, years=()):
     return cems_by_boiler
 
 
-def stuff(cems_by_boiler, gen, pudl_out):
+def stuff(cems_by_boiler, gen, pudl_out, unit_id_col):
     """Do cems stuff."""
+    idx_unit_cols = ['plant_id_eia', 'report_date', unit_id_col]
+
     eia_with_boiler_id = (
-        pudl_out.bga()[IDX_BOILER + ['unit_id_pudl']].drop_duplicates()
+        pudl_out.bga()[IDX_BOILER + ['unit_id_pudl', 'generator_id']]
+        .pipe(merge_gem_w_df, df_source='bga')
+        [IDX_BOILER + [unit_id_col]]
+        .drop_duplicates()
     )
+
     # Add boiler id to EIA data. Boilder id matches (almost) with CEMS unitid.
     eia_cems_merge = (
         pd.merge(
@@ -1317,7 +1323,7 @@ def stuff(cems_by_boiler, gen, pudl_out):
             how='right',
             validate='m:1'
         )
-        .groupby(IDX_UNIT, dropna=False)[COLS_SUM_CEMS]
+        .groupby(idx_unit_cols, dropna=False)[COLS_SUM_CEMS]
         .sum(min_count=1)
         .reset_index()
         .assign(so2_mass_tons=lambda x: x.so2_mass_lbs / 2000,
@@ -1325,17 +1331,17 @@ def stuff(cems_by_boiler, gen, pudl_out):
         .drop(['so2_mass_lbs', 'nox_mass_lbs'], axis=1)
         .pipe(pudl.helpers.convert_cols_dtypes, 'eia')
         .merge(
-            gen.drop_duplicates(subset=IDX_UNIT)
-            [IDX_UNIT + ['operational_status', 'sector_name',
-                         'fuel_type_code_pudl']],
-            on=IDX_UNIT,
+            gen.drop_duplicates(subset=idx_unit_cols)
+            [idx_unit_cols + ['operational_status', 'sector_name',
+                              'fuel_type_code_pudl']],
+            on=idx_unit_cols,
             validate='1:1',
             how='left'
         )
         .merge(
-            gen.groupby(IDX_UNIT, dropna=False, as_index=False)
+            gen.groupby(idx_unit_cols, dropna=False, as_index=False)
             .agg({'unit_id_eia': str_squish, 'generator_id': str_squish}),
-            on=IDX_UNIT,
+            on=idx_unit_cols,
             how='left',
             validate='1:1'
         )
