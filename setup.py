@@ -18,7 +18,7 @@ setup(
     license="MIT",
     version='0.0.1',
     install_requires=[
-        "catalystcoop.pudl @ git+https://github.com/catalyst-cooperative/pudl.git@dev",
+        "catalystcoop.pudl",
     ],
     python_requires=">=3.8,<3.10",
     classifiers=[
